@@ -144,6 +144,11 @@ def process_transaction_rows(table, page_idx):
                     balance = clean_amount(next_row[4])
                     transaction['Deposits ($)'] = deposit or ''
                     transaction['Balance ($)'] = balance or ''
+                    logging.debug(f"Extracted deposit: {deposit}, balance: {balance} from next row")
+                else:
+                    logging.debug("Next row does not have enough columns")
+            else:
+                logging.debug("No next row available")
         if "MINIMUM $2000 IN DEPOSITS RECEIVED" in transaction['Transaction Details']:
             transaction['Transaction Details'] += " (Minimum Deposit)"
 
