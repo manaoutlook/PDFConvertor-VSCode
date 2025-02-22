@@ -65,6 +65,10 @@ def process_transaction_rows(table, page_idx):
     # Clean the table
     table = table.dropna(how='all').reset_index(drop=True)
 
+    logging.debug(f"Starting to process table on page {page_idx} with {len(table)} rows")
+    logging.debug(f"Table columns: {table.columns}")
+    logging.debug(f"First few rows: {table.head()}")
+
     def process_buffer():
         if not current_buffer:
             return None
@@ -74,6 +78,7 @@ def process_transaction_rows(table, page_idx):
         # Get date from first row
         date = parse_date(current_buffer[0][0])
         if not date:
+            logging.debug(f"Failed to parse date from: {current_buffer[0][0]}")
             return None
 
         # Initialize transaction
@@ -89,28 +94,60 @@ def process_transaction_rows(table, page_idx):
 
         # Process all rows
         details = []
-        for row in current_buffer:
+        withdrawal = ''
+        deposit = ''
+        balance = ''
+        for i, row in enumerate(current_buffer):
             # Add description
             if row[1].strip():
                 details.append(row[1].strip())
+                logging.debug(f"Added description: {row[1].strip()}")
 
-            # Process amounts
-            withdrawal = clean_amount(row[2])
-            deposit = clean_amount(row[3])
-            balance = clean_amount(row[4]) if len(row) > 4 else ''
+            # Process amounts with detailed logging
+            row_withdrawal = clean_amount(row[2])
+            row_deposit = clean_amount(row[3])
+            row_balance = clean_amount(row[4]) if len(row) > 4 else ''
+
+            logging.debug(f"Processing amounts - W: {row_withdrawal}, D: {row_deposit}, B: {row_balance}")
 
             # Update amounts if not already set
-            if withdrawal and not transaction['Withdrawals ($)']:
-                transaction['Withdrawals ($)'] = withdrawal
-            if deposit and not transaction['Deposits ($)']:
-                transaction['Deposits ($)'] = deposit
-            if balance and not transaction['Balance ($)']:
-                transaction['Balance ($)'] = balance
+            if row_withdrawal and not withdrawal:
+                withdrawal = row_withdrawal
+                logging.debug(f"Set withdrawal: {withdrawal}")
+            if row_deposit and not deposit:
+                deposit = row_deposit
+                logging.debug(f"Set deposit: {deposit}")
+      # Capture deposit and balance from the line containing the amounts
+            if i > 0 and row_deposit and row_balance:
+                deposit = row_deposit
+                balance = row_balance
+                logging.debug(f"Set deposit: {deposit}")
+                logging.debug(f"Set balance: {balance}")
+            elif row_balance and not balance:
+                balance = row_balance
+                logging.debug(f"Set balance: {balance}")
 
         # Join details
         transaction['Transaction Details'] = '\n'.join(filter(None, details))
+        transaction['Withdrawals ($)'] = withdrawal or ''
+        transaction['Deposits ($)'] = deposit or ''
+        transaction['Balance ($)'] = balance or ''
 
-        logging.debug(f"Processed transaction: {transaction}")
+        # Handle special transaction types
+        if "REVERSAL OF ACCOUNT SERVICING FEE" in transaction['Transaction Details']:
+            transaction['Transaction Details'] = "REVERSAL OF ACCOUNT SERVICING FEE (Fee Reversal)"
+            # Extract deposit and balance from the next line
+            if len(current_buffer) > 1:
+                next_row = current_buffer[1]
+                if len(next_row) > 3:
+                    deposit = clean_amount(next_row[3])
+                    balance = clean_amount(next_row[4])
+                    transaction['Deposits ($)'] = deposit or ''
+                    transaction['Balance ($)'] = balance or ''
+        if "MINIMUM $2000 IN DEPOSITS RECEIVED" in transaction['Transaction Details']:
+            transaction['Transaction Details'] += " (Minimum Deposit)"
+
+        logging.debug(f"Final transaction: {transaction}")
         return transaction
 
     # Process each row
@@ -126,7 +163,7 @@ def process_transaction_rows(table, page_idx):
             'TRANSACTION DETAILS', 'WITHDRAWALS', 'DEPOSITS', 'BALANCE',
             'OPENING', 'TOTALS AT END OF PAGE', 'TOTALS FOR PERIOD'
         ]):
-            # Process any current buffer before skipping
+            logging.debug(f"Skipping header row: {row_values}")
             if current_buffer:
                 trans = process_buffer()
                 if trans:
@@ -134,9 +171,11 @@ def process_transaction_rows(table, page_idx):
                 current_buffer = []
             continue
 
-        # Check for date
+        # Check for date and content
         has_date = bool(parse_date(row_values[0]))
-        has_content = any(val.strip() for val in row_values[1:-1])
+        has_content = any(val.strip() for val in row_values[1:5])  # Include amount columns in content check
+
+        logging.debug(f"Row analysis - has_date: {has_date}, has_content: {has_content}")
 
         if has_date:
             # Process previous buffer if exists
@@ -192,6 +231,7 @@ def convert_pdf_to_data(pdf_path: str):
         ]
 
         # Extract tables from PDF
+        logging.debug("Attempting to extract tables from PDF")
         tables = tabula.read_pdf(
             pdf_path,
             pages='all',
@@ -207,12 +247,16 @@ def convert_pdf_to_data(pdf_path: str):
             logging.error("No tables extracted from PDF")
             return None
 
+        logging.debug(f"Extracted {len(tables)} tables from PDF")
+
         all_transactions = []
         seen_transactions = set()
 
         # Process each table
         for page_idx, table in enumerate(tables):
             logging.debug(f"Processing table {page_idx+1}, shape: {table.shape}")
+            logging.debug(f"Table contents:\n{table}")
+
             if len(table.columns) >= 4:  # Ensure table has required columns
                 table.columns = range(len(table.columns))
                 transactions = process_transaction_rows(table, page_idx)
@@ -231,6 +275,7 @@ def convert_pdf_to_data(pdf_path: str):
                     if trans_key not in seen_transactions:
                         seen_transactions.add(trans_key)
                         all_transactions.append(trans)
+                        logging.debug(f"Added unique transaction: {trans}")
                     else:
                         logging.debug(f"Skipping duplicate transaction: {trans}")
 
@@ -238,20 +283,7 @@ def convert_pdf_to_data(pdf_path: str):
             logging.error("No transactions extracted from tables")
             return None
 
-        # Sort transactions by page and row index
-        all_transactions.sort(key=lambda x: (x['_page_idx'], x['_row_idx']))
-
-        # Remove temporary sorting fields
-        for trans in all_transactions:
-            trans.pop('_page_idx', None)
-            trans.pop('_row_idx', None)
-
         logging.info(f"Successfully extracted {len(all_transactions)} unique transactions")
-
-        # Log all transactions for verification
-        for idx, trans in enumerate(all_transactions):
-            logging.debug(f"Transaction {idx+1}: {trans}")
-
         return all_transactions
 
     except Exception as e:
